@@ -3,7 +3,8 @@
 #include <unistd.h>
 #include <stdlib.h>
 #include <pthread.h>
-#include "queue/queue.h"
+#include <string.h>
+#include "queue.h"
 #include "sut.h"
 #include <arpa/inet.h>
 #include <sys/types.h>
@@ -16,9 +17,11 @@ pthread_t c_exec, i_exec;
 //Global lock is needed for when the two threads want to touch the queue
 static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t i_lock = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t icond = PTHREAD_COND_INITIALIZER;
+static pthread_mutex_t fromio_lock = PTHREAD_MUTEX_INITIALIZER;
+// Buffer since only one item can run on the c-exec at once, it is safe to have a global variable that can be returned without malloc
+char c_buf[BUFSIZE];
 
-void *cexec_main(void *args){
+void *cexec_main(){
 	// This is the main kernel level thread which does the C-exec
 	printf("Started the C-EXEC!\n");
     // Busy wait until there is a thread created
@@ -42,7 +45,7 @@ void *cexec_main(void *args){
             }
             popped = queue_pop_head(&task_ready); // Pop the task on the head of the ready queue.
             pthread_mutex_unlock(&mutex);
-            running = popped->data;
+            running = (sut_t *) popped->data;
             // Swap the contexts and start running the next thread!
             swapcontext(&(running->parent), &(running->threadcontext));
             // Per assignment requirements, issue a usleep for 100 microseconds 
@@ -83,6 +86,8 @@ void *iexec_main(){
     }
     while (1){
         pthread_mutex_lock(&i_lock);
+        // We can guarantee by using an if, no two commands can be done simulataneously. If one command has not finished processing, the next command will
+        // Not be serviced.
         if (queue_peek_front(&io_to)){
             // If there is a io_to waiting, handle
             struct queue_entry *to_head = queue_pop_head(&io_to);
@@ -90,61 +95,89 @@ void *iexec_main(){
             msg_t *msg_to = (msg_t *)to_head->data;
             if (msg_to->type == 1){
                 // Service open command.
-                struct queue_entry *wait_head =  queue_peek_front(&wait);
-                sut_t *task = wait_head->data;
-                // Ensure the first element on the io_queue is the same task as the element on the qait queue. If they are not the same, then this task is some other type 
-                if (task->threadid == msg_to->task->threadid){
-                    /**
-                     * Only on confirmation that both the task wait and io message in are the same task can we pop the head of the task wait.
-                     * This means we
-                    **/
-                    open_msg_t *open = (open_msg_t *)msg_to->msg;
-                    wait_head =  queue_pop_head(&wait);
-                    task = (sut_t *)wait_head->data;
-                    struct sockaddr_in server_address = { 0 };
+                open_msg_t *open = (open_msg_t *)msg_to->msg;
+                struct queue_entry *wait_head =  queue_pop_head(&wait);
+                // release the io to lock
+                pthread_mutex_unlock(&i_lock);
+                sut_t *task = (sut_t *)wait_head->data;
+                struct sockaddr_in server_address = { 0 };
 
-                    // create a new socket
-                    msg_to->task->file = socket(AF_INET, SOCK_STREAM, 0);
+                // create a new socket
+                *(open->sockfd) = socket(AF_INET, SOCK_STREAM, 0);
 
-                    // connect to server
-                    server_address.sin_family = AF_INET;
-                    inet_pton(AF_INET, open->ip, &(server_address.sin_addr.s_addr));
-                    server_address.sin_port = htons(open->port);
-                    if(connect(msg_to->task->file, (struct sockaddr *)&server_address, sizeof(server_address)) < 0){
-                        printf("Problem opening connection!\n");
-                    }
-                    free(wait_head);
-                    struct queue_entry *task_node = queue_new_node(task);
-                    pthread_mutex_lock(&mutex);
-                    queue_insert_tail(&task_ready, task_node);
-                    pthread_mutex_unlock(&mutex);
-                    free(open);
+                // connect to server
+                server_address.sin_family = AF_INET;
+                inet_pton(AF_INET, open->ip, &(server_address.sin_addr.s_addr));
+                server_address.sin_port = htons(open->port);
+                if(connect(*(open->sockfd), (struct sockaddr *)&server_address, sizeof(server_address)) < 0){
+                    printf("Problem opening connection!\n");
                 }
+                free(wait_head);
+                struct queue_entry *task_node = queue_new_node(task);
+                pthread_mutex_lock(&mutex);
+                queue_insert_tail(&task_ready, task_node);
+                pthread_mutex_unlock(&mutex);
+                free(open);
             } else if(msg_to->type == 2){
-                // Service close command.
-                close(msg_to->task->file);
-            }else {
+                // Release io to lock and service close command.
+                pthread_mutex_unlock(&i_lock);
+                int_msg_t *close_msg = (int_msg_t *)msg_to->msg;
+                // Close the socket fd and free the node.
+                close(*(close_msg->sockfd));
+                free(close_msg);
+            }else if(msg_to->type == 3) {
+                // Service the read command
+                int_msg_t *read_msg = (int_msg_t *)msg_to->msg;
+                struct queue_entry *wait_head =  queue_pop_head(&wait);
+                // release the io to lock
+                pthread_mutex_unlock(&i_lock);
+                sut_t *task = (sut_t *)wait_head->data;
+                msg_t *msg_from = (msg_t *)malloc(sizeof(msg_t));
+                msg_from->task_id = msg_to->task_id;
+                msg_from->type = 0;
+                read_msg_t *read = (read_msg_t *)malloc(sizeof(read_msg_t));
+                if (recv(*(read_msg->sockfd), read->ret, BUFSIZE, 0) < 0){
+                    printf("Failed to read!\n");
+                }
+                msg_from->msg = (void *)read;
+                struct queue_entry *from_node = queue_new_node(msg_from);
+                struct queue_entry *task_node = queue_new_node(task);
+
+
+                pthread_mutex_lock(&fromio_lock);
+                pthread_mutex_lock(&mutex);
+
+                queue_insert_tail(&io_from, from_node);
+                queue_insert_tail(&task_ready, task_node);
+
+                pthread_mutex_unlock(&fromio_lock);
+                pthread_mutex_unlock(&mutex);
+
+                free(wait_head);
+                free(read_msg);
+
+            } else {
                 /**
-                 * Service the write command.
+                 * Release lock and service the write command.
                  * Sending data over the server to the socket opened in the file. Use  MSG_NOSIGNAL in the handling of errors. As per requirements of the assignment,
                  * We do not handle errors. Thus we choose to ignore the errors on send thus allowing the execution of the program to continue.
                 **/
-                buf_msg_t *open = (buf_msg_t *)msg_to->msg;
-                if (send(msg_to->task->file, open->message, open->size, MSG_NOSIGNAL)<0){
+                pthread_mutex_unlock(&i_lock);
+                buf_msg_t *write = (buf_msg_t *)msg_to->msg;
+                if (send(*(write->sockfd), write->message, write->size, 0)<0){
                     printf("Failed to send\n");
                 }
-                free(open);
+                free(write);
             }
             // Both of these were malloced into the memory! Free them.
             free(to_head);
             free(msg_to);
+        } else {
+            // Nothing to see, unlock the lock!
+            pthread_mutex_unlock(&i_lock);
         }
         // Release the lock. Releasing after the write is to ensure the read process cannot begin before the write is finished. 
         // Releasing after open connection has been serviced as well therefore, we can ensure no race condition on the socket!
-        pthread_mutex_unlock(&i_lock);
-        /**
-         * TODO: Service a read!
-         **/ 
 
         // We are running until we get a signal that we are done.
         pthread_mutex_lock(&i_lock);
@@ -237,7 +270,7 @@ void sut_yield(){
 
 }
 void sut_exit(){
-    // This function needs to context swtich back to the parent and release its malloced memory
+    // This function needs to context switch back to the parent and release its malloced memory
     // Do not put this task back into the task ready queue! It is done.
     free(running->threadstack);
     // Set the exit value to be true on the thread.
@@ -255,11 +288,11 @@ void sut_open(char *dest, int port){
     open_msg_t *open = (open_msg_t *)malloc(sizeof(open_msg_t));
     // Flag 1: open connection
     message->type = 1;
-    message->task = running;
+    message->task_id = running->threadid;
+    open->sockfd = &(running->file);
     open->ip = dest;
     open->port = port;
     message->msg = (void *)open;
-    printf("Made it here\n");
     struct queue_entry *msg_node = queue_new_node(message);
     struct queue_entry *task_node = queue_new_node(running);
     // Signal to the i_exec that we are done!
@@ -276,7 +309,8 @@ void sut_write(char *buf, int size){
     msg_t *message = (msg_t *)malloc(sizeof(msg_t));
     buf_msg_t *open = (buf_msg_t *)malloc(sizeof(buf_msg_t));
     message->type = 0;
-    message->task = running;
+    message->task_id = running->threadid;
+    open->sockfd = &(running->file);
     open->message = buf;
     open->size = size;
     // Cast the buf message to void type in order to be put into the message param of msg_t pointer.
@@ -289,16 +323,46 @@ void sut_write(char *buf, int size){
 void sut_close(){
     // Non-blocking close of the file descriptor connected to the task. 
     msg_t *message = (msg_t *)malloc(sizeof(msg_t));
+    int_msg_t *open = (int_msg_t *)malloc(sizeof(int_msg_t));
     message->type = 2;
-    message->task = running;
-    // No message to be passed.
+    message->task_id = running->threadid;
+    open->sockfd = &(running->file);
+    message->msg = (void *) open;
+    // No internal message to be passed.
     struct queue_entry *node = queue_new_node(message);
     pthread_mutex_lock(&i_lock);
     queue_insert_tail(&io_to, node);
     pthread_mutex_unlock(&i_lock);
 }
 char *sut_read(){
-	return NULL;
+    // Blocking read
+    msg_t *message = (msg_t *)malloc(sizeof(msg_t));
+    int_msg_t *open = (int_msg_t *)malloc(sizeof(int_msg_t));
+    message->type = 3;
+    message->task_id = running->threadid;
+    open->sockfd = &(running->file);
+    message->msg = (void *) open;
+    // No internal message to be passed.
+    struct queue_entry *msg_node = queue_new_node(message);
+    struct queue_entry *task_node = queue_new_node(running);
+    pthread_mutex_lock(&i_lock);
+    queue_insert_tail(&io_to, msg_node);
+    queue_insert_tail(&wait, task_node);
+    pthread_mutex_unlock(&i_lock);
+    // return power to C-exec.
+    swapcontext(&(running->threadcontext), &(running->parent));
+    // After having been reschuduled, you continue execution of the read
+    pthread_mutex_lock(&fromio_lock);
+    // Pop the top of the from_io queue off
+    msg_node = queue_pop_head(&io_from);
+    pthread_mutex_unlock(&fromio_lock);
+    message = (msg_t *)msg_node->data;
+    read_msg_t *msg_ret = (read_msg_t *) message->msg;
+    memcpy(&c_buf, msg_ret->ret, BUFSIZE);
+    free(msg_ret);
+    free(msg_node);
+    free(message);
+	return c_buf;
 }
 
 void sut_shutdown(){

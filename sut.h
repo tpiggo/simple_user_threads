@@ -3,8 +3,9 @@
 #include <stdbool.h>
 #include <ucontext.h>
 
-#define MAX_THREADS                        100
-#define THREAD_STACK_SIZE                  1024*64
+#define MAX_THREADS         100
+#define THREAD_STACK_SIZE   1024*64
+#define BUFSIZE             128
 
 typedef void (*sut_task_f)();
 
@@ -15,7 +16,6 @@ typedef struct __sut
 	void *threadfunc;
     int threadexited;
     int file;
-    char *response;
 	ucontext_t threadcontext;
     ucontext_t parent;
 } sut_t;
@@ -23,16 +23,26 @@ typedef struct __sut
 typedef struct __open_msg{
     int port;
     char *ip;
+    int *sockfd;
 } open_msg_t;
 
 typedef struct __buf_msg{
     char *message;
     int size;
+    int *sockfd;
 }buf_msg_t;
+
+typedef struct __int_msg{
+    int *sockfd;
+} int_msg_t;
+
+typedef struct __read_msg{
+    char ret[BUFSIZE];
+}read_msg_t;
 
 typedef struct __msg_t{
     int type;
-    sut_t *task;
+    int task_id;
     void *msg;
 } msg_t;
 
