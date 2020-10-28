@@ -14,10 +14,13 @@ int nextid, livethreads, done_p;
 sut_t *running;
 struct queue task_ready, wait, io_to, io_from;
 pthread_t c_exec, i_exec;
-//Global lock is needed for when the two threads want to touch the queue
+struct queue_entry *c_popped_task, *i_popped_task;
+// global locks
 static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t i_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t fromio_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t io_op_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t i_cond = PTHREAD_COND_INITIALIZER;
 // Buffer since only one item can run on the c-exec at once, it is safe to have a global variable that can be returned without malloc
 char c_buf[BUFSIZE];
 
@@ -43,18 +46,17 @@ void *cexec_main(){
                 pthread_mutex_unlock(&mutex);
                 break;
             }
-            popped = queue_pop_head(&task_ready); // Pop the task on the head of the ready queue.
+            c_popped_task = queue_pop_head(&task_ready); // Pop the task on the head of the ready queue.
             pthread_mutex_unlock(&mutex);
-            running = (sut_t *) popped->data;
+            running = (sut_t *) c_popped_task->data;
             // Swap the contexts and start running the next thread!
             swapcontext(&(running->parent), &(running->threadcontext));
             // Per assignment requirements, issue a usleep for 100 microseconds 
             usleep(100);
-            // Since we are readding it to the queue using queue_new_node, we can be sure it is safe to free
-            free(popped);
             if (running->threadexited){
                 // Check if the thread exited. If it did, free its memory and move on.
                 free(running);
+                free(c_popped_task);
             }
         }
         // Acquire the lock and check if there are live threads. If so, continue if not you're done.
@@ -69,6 +71,8 @@ void *cexec_main(){
 	printf("Exiting C-EXEC\n");
     // Signal to the i_exec that we are done!
     pthread_mutex_lock(&i_lock);
+    if (!queue_peek_front(&io_to))
+        pthread_cond_signal(&i_cond);
     done_p = 1;
     pthread_mutex_unlock(&i_lock);
 	pthread_exit(0);
@@ -99,23 +103,25 @@ void *iexec_main(){
                 struct queue_entry *wait_head =  queue_pop_head(&wait);
                 // release the io to lock
                 pthread_mutex_unlock(&i_lock);
+
                 sut_t *task = (sut_t *)wait_head->data;
                 struct sockaddr_in server_address = { 0 };
 
                 // create a new socket
                 *(open->sockfd) = socket(AF_INET, SOCK_STREAM, 0);
-
                 // connect to server
                 server_address.sin_family = AF_INET;
                 inet_pton(AF_INET, open->ip, &(server_address.sin_addr.s_addr));
                 server_address.sin_port = htons(open->port);
+                // Acquire io operation lock in order to guarantee connect completes before read or write begins
+                //pthread_mutex_lock(&io_op_lock);
                 if(connect(*(open->sockfd), (struct sockaddr *)&server_address, sizeof(server_address)) < 0){
                     printf("Problem opening connection!\n");
                 }
-                free(wait_head);
-                struct queue_entry *task_node = queue_new_node(task);
+                //pthread_mutex_unlock(&io_op_lock);
+                
                 pthread_mutex_lock(&mutex);
-                queue_insert_tail(&task_ready, task_node);
+                queue_insert_tail(&task_ready, wait_head);
                 pthread_mutex_unlock(&mutex);
                 free(open);
             } else if(msg_to->type == 2){
@@ -136,24 +142,25 @@ void *iexec_main(){
                 msg_from->task_id = msg_to->task_id;
                 msg_from->type = 0;
                 read_msg_t *read = (read_msg_t *)malloc(sizeof(read_msg_t));
-                if (recv(*(read_msg->sockfd), read->ret, BUFSIZE, 0) < 0){
+                // Hold IO lock in order to ensure no other opertion takes place.
+                //pthread_mutex_lock(&io_op_lock);
+                if (recv(*(read_msg->sockfd), read->ret, BUFSIZE, MSG_NOSIGNAL) < 0){
                     printf("Failed to read!\n");
                 }
+                //pthread_mutex_unlock(&io_op_lock);
                 msg_from->msg = (void *)read;
                 struct queue_entry *from_node = queue_new_node(msg_from);
-                struct queue_entry *task_node = queue_new_node(task);
 
-
+                // Double locking to perform the submission of the task and from_io return to be at the same spots in their queues, 
+                // thus as we pop we can ensure they will be popped at the same time
                 pthread_mutex_lock(&fromio_lock);
                 pthread_mutex_lock(&mutex);
 
                 queue_insert_tail(&io_from, from_node);
-                queue_insert_tail(&task_ready, task_node);
+                queue_insert_tail(&task_ready, wait_head);
 
                 pthread_mutex_unlock(&fromio_lock);
                 pthread_mutex_unlock(&mutex);
-
-                free(wait_head);
                 free(read_msg);
 
             } else {
@@ -163,10 +170,13 @@ void *iexec_main(){
                  * We do not handle errors. Thus we choose to ignore the errors on send thus allowing the execution of the program to continue.
                 **/
                 pthread_mutex_unlock(&i_lock);
+                // Aquire the io lock in order to guarantee write is completed before read.
+                //pthread_mutex_lock(&io_op_lock);
                 buf_msg_t *write = (buf_msg_t *)msg_to->msg;
-                if (send(*(write->sockfd), write->message, write->size, 0)<0){
+                if (send(*(write->sockfd), write->message, write->size, MSG_NOSIGNAL)<0){
                     printf("Failed to send\n");
                 }
+                //pthread_mutex_unlock(&io_op_lock);
                 free(write);
             }
             // Both of these were malloced into the memory! Free them.
@@ -174,11 +184,10 @@ void *iexec_main(){
             free(msg_to);
         } else {
             // Nothing to see, unlock the lock!
+            //pthread_mutex_lock(&i_lock);
+            pthread_cond_wait(&i_cond, &i_lock);
             pthread_mutex_unlock(&i_lock);
         }
-        // Release the lock. Releasing after the write is to ensure the read process cannot begin before the write is finished. 
-        // Releasing after open connection has been serviced as well therefore, we can ensure no race condition on the socket!
-
         // We are running until we get a signal that we are done.
         pthread_mutex_lock(&i_lock);
         if (done_p){
@@ -208,6 +217,7 @@ void sut_init(){
 	queue_init(&io_from);
     io_to = queue_create();
 	queue_init(&io_to);
+    
 	// Start the kernel level POSIX threads.
 	if (pthread_create(&c_exec, NULL, cexec_main, NULL)!=0){
 		printf("Problem starting thread!\n");
@@ -259,10 +269,8 @@ bool sut_create(sut_task_f fn){
 	return true;
 }
 void sut_yield(){
-	// Put yourself back onto the ready queue since you yielded, you're not done yet.
-	struct queue_entry *node = queue_new_node(running);
 	pthread_mutex_lock(&mutex);
-	queue_insert_tail(&task_ready, node);
+	queue_insert_tail(&task_ready, c_popped_task);
 	pthread_mutex_unlock(&mutex);
     // Problem: Cannot return to the prent like this
     //--> if you're coming back from i-exec, you mustn't force 2 versions of c-exec to be running :S
@@ -294,11 +302,13 @@ void sut_open(char *dest, int port){
     open->port = port;
     message->msg = (void *)open;
     struct queue_entry *msg_node = queue_new_node(message);
-    struct queue_entry *task_node = queue_new_node(running);
-    // Signal to the i_exec that we are done!
     pthread_mutex_lock(&i_lock);
+    // Check if there is anything on the queue, if not signal there is!
+    if (!queue_peek_front(&io_to))
+        pthread_cond_signal(&i_cond);
     queue_insert_tail(&io_to, msg_node);
-    queue_insert_tail(&wait, task_node);
+    // The C-exec running task is the one calling the open
+    queue_insert_tail(&wait, c_popped_task);
     pthread_mutex_unlock(&i_lock);
     // Once the message has been sent, allow C-exec to schedule a new task. Return control to c-exec.
     // As per assignment requirements.
@@ -317,6 +327,9 @@ void sut_write(char *buf, int size){
     message->msg = (void *)open;
     struct queue_entry *node = queue_new_node(message);
     pthread_mutex_lock(&i_lock);
+    // Check if there is anything on the queue, if not signal there is!
+    if (!queue_peek_front(&io_to))
+        pthread_cond_signal(&i_cond);
     queue_insert_tail(&io_to, node);
     pthread_mutex_unlock(&i_lock);
 }
@@ -331,6 +344,9 @@ void sut_close(){
     // No internal message to be passed.
     struct queue_entry *node = queue_new_node(message);
     pthread_mutex_lock(&i_lock);
+    // Check if there is anything on the queue, if not signal there is!
+    if (!queue_peek_front(&io_to))
+        pthread_cond_signal(&i_cond);
     queue_insert_tail(&io_to, node);
     pthread_mutex_unlock(&i_lock);
 }
@@ -344,10 +360,12 @@ char *sut_read(){
     message->msg = (void *) open;
     // No internal message to be passed.
     struct queue_entry *msg_node = queue_new_node(message);
-    struct queue_entry *task_node = queue_new_node(running);
     pthread_mutex_lock(&i_lock);
+    // Check if there is anything on the queue, if not signal there is!
+    if (!queue_peek_front(&io_to))
+        pthread_cond_signal(&i_cond);
     queue_insert_tail(&io_to, msg_node);
-    queue_insert_tail(&wait, task_node);
+    queue_insert_tail(&wait, c_popped_task);
     pthread_mutex_unlock(&i_lock);
     // return power to C-exec.
     swapcontext(&(running->threadcontext), &(running->parent));
