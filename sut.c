@@ -9,6 +9,8 @@
 #include <arpa/inet.h>
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <fcntl.h>
+#include <errno.h>
 
 int nextid, livethreads, done_p;
 sut_t *running;
@@ -113,13 +115,13 @@ void *iexec_main(){
                 server_address.sin_family = AF_INET;
                 inet_pton(AF_INET, open->ip, &(server_address.sin_addr.s_addr));
                 server_address.sin_port = htons(open->port);
-                // Acquire io operation lock in order to guarantee connect completes before read or write begins
-                //pthread_mutex_lock(&io_op_lock);
-                if(connect(*(open->sockfd), (struct sockaddr *)&server_address, sizeof(server_address)) < 0){
-                    printf("Problem opening connection!\n");
-                }
-                //pthread_mutex_unlock(&io_op_lock);
                 
+                if(connect(*(open->sockfd), (struct sockaddr *)&server_address, sizeof(server_address)) < 0){
+                    close(*(open->sockfd));
+                    // Setting this to -1 in order to ensure it is not a valid file descriptor.
+                    *(open->sockfd) = -1;
+                    perror("Error opening connection");
+                }
                 pthread_mutex_lock(&mutex);
                 queue_insert_tail(&task_ready, wait_head);
                 pthread_mutex_unlock(&mutex);
@@ -128,8 +130,13 @@ void *iexec_main(){
                 // Release io to lock and service close command.
                 pthread_mutex_unlock(&i_lock);
                 int_msg_t *close_msg = (int_msg_t *)msg_to->msg;
-                // Close the socket fd and free the node.
-                close(*(close_msg->sockfd));
+
+                if(fcntl(*(close_msg->sockfd), F_GETFD)){
+                    perror("Error closing file");
+                } else {
+                    // Close the socket fd and free the node.
+                    close(*(close_msg->sockfd));
+                }
                 free(close_msg);
             }else if(msg_to->type == 3) {
                 // Service the read command
@@ -142,12 +149,16 @@ void *iexec_main(){
                 msg_from->task_id = msg_to->task_id;
                 msg_from->type = 0;
                 read_msg_t *read = (read_msg_t *)malloc(sizeof(read_msg_t));
-                // Hold IO lock in order to ensure no other opertion takes place.
-                //pthread_mutex_lock(&io_op_lock);
-                if (recv(*(read_msg->sockfd), read->ret, BUFSIZE, MSG_NOSIGNAL) < 0){
-                    printf("Failed to read!\n");
+                
+                if(fcntl(*(read_msg->sockfd), F_GETFD)){
+                    perror("Error reading from connection");
+                } else{
+                    pthread_mutex_lock(&io_op_lock);
+                    recv(*(read_msg->sockfd), read->ret, BUFSIZE, 0);
+                    pthread_mutex_unlock(&io_op_lock);
+                    
                 }
-                //pthread_mutex_unlock(&io_op_lock);
+                
                 msg_from->msg = (void *)read;
                 struct queue_entry *from_node = queue_new_node(msg_from);
 
@@ -171,12 +182,16 @@ void *iexec_main(){
                 **/
                 pthread_mutex_unlock(&i_lock);
                 // Aquire the io lock in order to guarantee write is completed before read.
-                //pthread_mutex_lock(&io_op_lock);
                 buf_msg_t *write = (buf_msg_t *)msg_to->msg;
-                if (send(*(write->sockfd), write->message, write->size, MSG_NOSIGNAL)<0){
-                    printf("Failed to send\n");
+                
+                //int is_valid = fcntl(*(write->sockfd), F_GETFD);
+                if(fcntl(*(write->sockfd), F_GETFD)){
+                    perror("Error writing to connection");
+                } else{
+                    pthread_mutex_lock(&io_op_lock);
+                    send(*(write->sockfd), write->message, write->size, 0);
+                    pthread_mutex_unlock(&io_op_lock);
                 }
-                //pthread_mutex_unlock(&io_op_lock);
                 free(write);
             }
             // Both of these were malloced into the memory! Free them.
@@ -247,7 +262,7 @@ bool sut_create(sut_task_f fn){
     }
 	getcontext(&(tdesr->threadcontext));
     // Hold the file descriptor for the task
-    tdesr->file = 0;
+    tdesr->file = -1;
 	tdesr->threadstack = (char *)malloc(THREAD_STACK_SIZE);
 	tdesr->threadcontext.uc_stack.ss_sp = tdesr->threadstack;
 	tdesr->threadcontext.uc_stack.ss_size = THREAD_STACK_SIZE;
