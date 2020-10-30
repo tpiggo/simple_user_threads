@@ -41,7 +41,7 @@ void *cexec_main(){
 	while (1)
     {
         pthread_mutex_lock(&c_lock);
-		if (livethreads)
+	if (livethreads)
         {
             pthread_mutex_unlock(&c_lock);
             break;
@@ -325,6 +325,7 @@ bool sut_create(sut_task_f fn){
 
 	return true;
 }
+
 void sut_yield(){
 	pthread_mutex_lock(&c_lock);
 	queue_insert_tail(&task_ready, c_popped_task);
@@ -332,6 +333,7 @@ void sut_yield(){
 	swapcontext(&(running->threadcontext), running->threadcontext.uc_link);
 
 }
+
 void sut_exit(){
     // Free malloced memory
     free(running->threadstack);
@@ -344,6 +346,7 @@ void sut_exit(){
     swapcontext(&(running->threadcontext), running->threadcontext.uc_link);
 	
 }
+
 void sut_open(char *dest, int port){
     // Make space for sending message.
     msg_t *message = (msg_t *)malloc(sizeof(msg_t));
@@ -369,6 +372,7 @@ void sut_open(char *dest, int port){
     swapcontext(&(running->threadcontext), running->threadcontext.uc_link);
 
 }
+
 void sut_write(char *buf, int size){
     msg_t *message = (msg_t *)malloc(sizeof(msg_t));
     buf_msg_t *write_msg = (buf_msg_t *)malloc(sizeof(buf_msg_t));
@@ -388,6 +392,7 @@ void sut_write(char *buf, int size){
     queue_insert_tail(&io_to, node);
     pthread_mutex_unlock(&i_lock);
 }
+
 void sut_close(){
     // Non-blocking close of the file descriptor connected to the task. 
     msg_t *message = (msg_t *)malloc(sizeof(msg_t));
@@ -406,6 +411,7 @@ void sut_close(){
     queue_insert_tail(&io_to, node);
     pthread_mutex_unlock(&i_lock);
 }
+
 char *sut_read(){
     msg_t *message = (msg_t *)malloc(sizeof(msg_t));
     int_msg_t *read = (int_msg_t *)malloc(sizeof(int_msg_t));
